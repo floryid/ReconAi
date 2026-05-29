@@ -1,12 +1,33 @@
 # ReconAi
 
-AI-powered reconnaissance triage tool untuk bug bounty & pentest. Fokus ke output yang cepat dibaca: attack surface, subdomain, endpoint, parameter rawan, JS intel, dan scoring severity otomatis.
+ReconAi adalah tool reconnaissance triage untuk bug bounty & pentest yang fokus ke 1 hal: **membuat recon output langsung “enak dibaca” dan siap ditindak**.  
+Ia menggabungkan discovery + subdomain + JS intelligence + API spec detection + scoring severity dalam satu CLI.
 
-## Install
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
+[![CLI](https://img.shields.io/badge/Interface-CLI-informational)](#quick-start)
+
+## Kenapa ReconAi
+
+- Recon itu selalu dibutuhkan, tapi hasilnya sering bikin overwhelmed.
+- ReconAi membantu **prioritize**: mana yang high-value (admin surface, docs, graphQL, param rawan, JS leaks) supaya waktu hunting lebih efisien.
+
+## Fitur Utama
+
+- **Attack Surface Probe**: cek path umum (admin, swagger/docs, graphql, OIDC discovery).
+- **Subdomain Discovery (best-effort)**: CT + DNS dataset + parsing konten + DNS probing + live probing.
+- **JS Intelligence**: extract endpoint, high entropy strings, secrets/tokens pattern, internal indicators.
+- **API Spec Intelligence**: deteksi & parse OpenAPI/Swagger (JSON + fallback YAML sederhana) untuk mapping endpoint/parameter/auth scheme.
+- **Smart Parameter Ranking**: scoring indikasi **IDOR / SSRF / Open Redirect** dari nama parameter.
+- **GraphQL Probe ringan**: deteksi endpoint + indikasi introspection.
+- **Severity Scoring + AI Explanation**: setiap temuan diberi skor & penjelasan singkat untuk triage cepat.
+- **UX “terlihat jalan”**: ada status loading “Scanning…” dengan tahap-tahap scan.
+
+## Quick Start
+
+### Install
 
 Requirement:
 - Python 3.10+
-- `rich`
 
 Install dependency:
 
@@ -14,7 +35,7 @@ Install dependency:
 pip install rich
 ```
 
-## Quick Start
+### Run
 
 Scan target:
 
@@ -37,27 +58,39 @@ Tuning request:
 python reconai.py -d target.com --timeout 12 --max-js 12 --workers 8
 ```
 
-## Output yang Dicari
+## Output (yang akan kamu lihat)
 
 ReconAi bantu menyorot hal-hal seperti:
 - Admin panel kemungkinan internal
 - Endpoint dengan auth lemah (heuristic)
 - GraphQL menarik + probe introspection ringan
 - Parameter rawan IDOR / SSRF / Open Redirect (Smart Parameter Ranking)
-- JS intelligence: extract endpoint, high entropy strings, secrets/tokens pattern, internal indicators
+- JS intelligence: endpoint, high entropy strings, secrets/tokens pattern, internal indicators
 - API shadow endpoints (muncul di JS tapi tidak di HTML)
-- Subdomain discovery (best-effort) + live probing
+- Subdomain discovery + live probing
 - Severity scoring otomatis + AI explanation singkat
+
+## Contoh (Ringkas)
+
+```bash
+python reconai.py -d target.com -p full --timeout 12 --max-js 12 --workers 8
+```
+
+Yang biasanya jadi “headline”:
+- Panel **ReconAI Metrics** (ringkasan)
+- Tree **Attack Surface / JS Intelligence / Smart Parameters / GraphQL**
+- Section **Subdomains** (terpisah, mudah dilihat)
+- **Prioritized Findings** + **AI Explanation**
 
 ## Cara Kerja (Ringkas)
 
 - Discovery: fetch HTML, ekstrak link/form/script, crawl ringan, probe path umum
-- Subdomain: gabungan sumber OSINT (CT/DNS dataset) + DNS probing (DoH) + parsing dari konten
+- Subdomain: gabungan OSINT (CT/DNS dataset) + parsing dari konten + DNS probing (DoH) + live probing
 - JS intel: download JS & inline script, cari endpoint/secrets/tokens/entropy/internal
-- API spec: deteksi & parse OpenAPI/Swagger (JSON + fallback YAML sederhana)
+- API spec: deteksi & parse OpenAPI/Swagger untuk mapping endpoint/parameter/auth scheme
 - Scoring: setiap temuan diberi skor → severity (INFO/LOW/MEDIUM/HIGH/CRITICAL)
 
-## Catatan Penting
+## Catatan & Legal
 
 - Tool ini dibuat untuk triage cepat, bukan pengganti manual verification.
 - Subdomain discovery bersifat best-effort (tidak mungkin 100% lengkap tanpa sumber internal).
