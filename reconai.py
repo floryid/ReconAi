@@ -1572,107 +1572,109 @@ def run_recon(target: str, *, profile: str, timeout: float, insecure: bool, max_
     console.print("[bold cyan]ReconAI[/bold cyan]")
     console.print(f"[bold white]ReconAI Triage[/bold white]  profile={profile}\n")
     console.print(f"[bold green]Target[/bold green] {base_url}\n")
-
-    root = fetch(base_url, timeout=timeout, insecure=insecure, max_bytes=1_500_000)
-    html_text = ""
-    if root and root.body:
-        html_text = root.body.decode("utf-8", errors="ignore")
-    if root:
-        state.notes.extend(identify_infra(root.headers))
-    links, scripts, forms, inline_scripts = parse_html_for_assets(base_url, html_text)
-    extracted_from_root = extract_urls_from_text(base_url, html_text)
-    for blob in inline_scripts:
-        extracted_from_root |= extract_urls_from_text(base_url, blob)
-    state.discovered_urls |= extracted_from_root
-    if profile in {"full", "deep"} and root_domain:
-        state.subdomains |= extract_subdomains_from_text(root_domain, html_text)
-        for blob in inline_scripts:
-            state.subdomains |= extract_subdomains_from_text(root_domain, blob)
-    for u in links.union(forms):
-        if is_same_site(base_url, u):
-            state.html_urls.add(u)
-            state.discovered_urls.add(u)
-    for s in scripts:
-        try:
-            host = urlparse(s).netloc.lower()
-        except Exception:
-            host = ""
-        if not host or is_related_host(base_host, host):
-            state.js_urls.add(s)
-            state.discovered_urls.add(s)
-
-    if profile in {"full", "deep", "api", "javascript"}:
-        state.surface_findings.extend(probe_common_paths(base_url, timeout=timeout, insecure=insecure))
-        for f in state.surface_findings:
-            state.discovered_urls.add(f.url)
-
-    if profile in {"full", "deep"} and root_domain:
-        subs: set[str] = set()
-        subs |= certspotter_subdomains(root_domain, timeout=timeout, insecure=insecure)
-        subs |= crtsh_subdomains(root_domain, timeout=timeout, insecure=insecure)
-        subs |= bufferover_subdomains(root_domain, timeout=timeout, insecure=insecure)
-        subs |= rapiddns_subdomains(root_domain, timeout=timeout, insecure=insecure)
-        subs |= bruteforce_subdomains(root_domain, timeout=timeout, insecure=insecure, max_hits=80)
-        subs |= extract_subdomains_from_urls(root_domain, state.discovered_urls)
-        subs |= extract_subdomains_from_urls(root_domain, (f.url for f in state.surface_findings))
-        subs = {s for s in subs if s and s != root_domain}
-        state.subdomains |= subs
-        state.live_subdomains |= probe_live_hosts(subs, timeout=timeout, insecure=insecure, max_hosts=40)
-        state.notes.append(f"Subdomains: {len(state.subdomains)} (live: {len(state.live_subdomains)})")
-
-    crawl_depth = 1 if profile in {"full", "deep"} else 0
-    crawl_pages = 18 if profile in {"full", "deep"} else 8
-    crawled_html, crawled_js, crawled_inline, crawled_urls = crawl_html(
-        base_url,
-        [base_url] + list(state.html_urls)[:8] + [f.url for f in state.surface_findings[:6]],
-        timeout=timeout,
-        insecure=insecure,
-        max_depth=crawl_depth,
-        max_pages=crawl_pages,
-    )
-    state.html_urls |= crawled_html
-    state.js_urls |= crawled_js
-    state.discovered_urls |= crawled_html | crawled_js | crawled_urls
-    if profile in {"full", "deep"} and root_domain:
-        state.subdomains |= extract_subdomains_from_urls(root_domain, crawled_urls)
-        state.subdomains |= extract_subdomains_from_urls(root_domain, crawled_js)
-        for blob in crawled_inline[:40]:
-            state.subdomains |= extract_subdomains_from_text(root_domain, blob)
-
-    js_to_fetch = list(state.js_urls)[:max_js] if profile in {"full", "deep", "javascript"} else []
-    js_texts: dict[str, str] = {}
-    if js_to_fetch:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-            futs = {ex.submit(fetch, u, timeout=timeout, insecure=insecure, max_bytes=2_000_000): u for u in js_to_fetch}
-            for fut in as_completed(futs):
-                u = futs[fut]
-                res = None
-                try:
-                    res = fut.result()
-                except Exception:
-                    res = None
-                if not res or not res.body:
-                    continue
-                js_texts[u] = res.body.decode("utf-8", errors="ignore")
-
     js_intel_findings: list[Finding] = []
     internal_seen: set[str] = set()
-    for js_url, js_text in js_texts.items():
-        endpoints, secrets, intel, internal = analyze_js_blob(base_url, js_url, js_text)
-        for u in endpoints:
-            if is_same_site(base_url, u):
-                state.endpoints_from_js.add(u)
-                state.discovered_urls.add(u)
-        state.secrets.extend(secrets)
-        js_intel_findings.extend(intel)
-        internal_seen |= internal
-        if profile in {"full", "deep"} and root_domain:
-            state.subdomains |= extract_subdomains_from_text(root_domain, js_text)
+    openapi_findings: list[Finding] = []
+    openapi_param_refs: list[tuple[str, str, str]] = []
+    openapi_endpoints: set[str] = set()
+    shadow_endpoints: list[Finding] = []
 
-    if profile in {"full", "deep", "javascript"}:
-        for idx, blob in enumerate(crawled_inline[:25]):
-            pseudo = f"{base_url}#inline-{idx+1}"
-            endpoints, secrets, intel, internal = analyze_js_blob(base_url, pseudo, blob)
+    with console.status("[bold cyan]Scanning...[/bold cyan]", spinner="line") as status:
+        status.update("[bold cyan]Resolving target & fetching root...[/bold cyan]")
+        root = fetch(base_url, timeout=timeout, insecure=insecure, max_bytes=1_500_000)
+        html_text = ""
+        if root and root.body:
+            html_text = root.body.decode("utf-8", errors="ignore")
+        if root:
+            state.notes.extend(identify_infra(root.headers))
+
+        links, scripts, forms, inline_scripts = parse_html_for_assets(base_url, html_text)
+        extracted_from_root = extract_urls_from_text(base_url, html_text)
+        for blob in inline_scripts:
+            extracted_from_root |= extract_urls_from_text(base_url, blob)
+        state.discovered_urls |= extracted_from_root
+        if profile in {"full", "deep"} and root_domain:
+            state.subdomains |= extract_subdomains_from_text(root_domain, html_text)
+            for blob in inline_scripts:
+                state.subdomains |= extract_subdomains_from_text(root_domain, blob)
+
+        for u in links.union(forms):
+            if is_same_site(base_url, u):
+                state.html_urls.add(u)
+                state.discovered_urls.add(u)
+        for s in scripts:
+            try:
+                host = urlparse(s).netloc.lower()
+            except Exception:
+                host = ""
+            if not host or is_related_host(base_host, host):
+                state.js_urls.add(s)
+                state.discovered_urls.add(s)
+
+        if profile in {"full", "deep", "api", "javascript"}:
+            status.update("[bold cyan]Probing common attack-surface paths...[/bold cyan]")
+            state.surface_findings.extend(probe_common_paths(base_url, timeout=timeout, insecure=insecure))
+            for f in state.surface_findings:
+                state.discovered_urls.add(f.url)
+
+        if profile in {"full", "deep"} and root_domain:
+            status.update("[bold cyan]Enumerating subdomains (OSINT + DNS)...[/bold cyan]")
+            subs: set[str] = set()
+            subs |= certspotter_subdomains(root_domain, timeout=timeout, insecure=insecure)
+            subs |= crtsh_subdomains(root_domain, timeout=timeout, insecure=insecure)
+            subs |= bufferover_subdomains(root_domain, timeout=timeout, insecure=insecure)
+            subs |= rapiddns_subdomains(root_domain, timeout=timeout, insecure=insecure)
+            subs |= bruteforce_subdomains(root_domain, timeout=timeout, insecure=insecure, max_hits=80)
+            subs |= extract_subdomains_from_urls(root_domain, state.discovered_urls)
+            subs |= extract_subdomains_from_urls(root_domain, (f.url for f in state.surface_findings))
+            subs = {s for s in subs if s and s != root_domain}
+            state.subdomains |= subs
+            status.update("[bold cyan]Probing live subdomains...[/bold cyan]")
+            state.live_subdomains |= probe_live_hosts(subs, timeout=timeout, insecure=insecure, max_hosts=40)
+            state.notes.append(f"Subdomains: {len(state.subdomains)} (live: {len(state.live_subdomains)})")
+
+        status.update("[bold cyan]Crawling HTML & collecting assets...[/bold cyan]")
+        crawl_depth = 1 if profile in {"full", "deep"} else 0
+        crawl_pages = 18 if profile in {"full", "deep"} else 8
+        crawled_html, crawled_js, crawled_inline, crawled_urls = crawl_html(
+            base_url,
+            [base_url] + list(state.html_urls)[:8] + [f.url for f in state.surface_findings[:6]],
+            timeout=timeout,
+            insecure=insecure,
+            max_depth=crawl_depth,
+            max_pages=crawl_pages,
+        )
+        state.html_urls |= crawled_html
+        state.js_urls |= crawled_js
+        state.discovered_urls |= crawled_html | crawled_js | crawled_urls
+        if profile in {"full", "deep"} and root_domain:
+            state.subdomains |= extract_subdomains_from_urls(root_domain, crawled_urls)
+            state.subdomains |= extract_subdomains_from_urls(root_domain, crawled_js)
+            for blob in crawled_inline[:40]:
+                state.subdomains |= extract_subdomains_from_text(root_domain, blob)
+
+        js_to_fetch = list(state.js_urls)[:max_js] if profile in {"full", "deep", "javascript"} else []
+        js_texts: dict[str, str] = {}
+        if js_to_fetch:
+            status.update("[bold cyan]Fetching JavaScript bundles...[/bold cyan]")
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+                futs = {
+                    ex.submit(fetch, u, timeout=timeout, insecure=insecure, max_bytes=2_000_000): u for u in js_to_fetch
+                }
+                for fut in as_completed(futs):
+                    u = futs[fut]
+                    res = None
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        res = None
+                    if not res or not res.body:
+                        continue
+                    js_texts[u] = res.body.decode("utf-8", errors="ignore")
+
+        status.update("[bold cyan]Analyzing JS intelligence...[/bold cyan]")
+        for js_url, js_text in js_texts.items():
+            endpoints, secrets, intel, internal = analyze_js_blob(base_url, js_url, js_text)
             for u in endpoints:
                 if is_same_site(base_url, u):
                     state.endpoints_from_js.add(u)
@@ -1680,67 +1682,78 @@ def run_recon(target: str, *, profile: str, timeout: float, insecure: bool, max_
             state.secrets.extend(secrets)
             js_intel_findings.extend(intel)
             internal_seen |= internal
-    if profile in {"full", "deep"} and root_domain:
-        state.subdomains |= extract_subdomains_from_urls(root_domain, state.endpoints_from_js)
+            if profile in {"full", "deep"} and root_domain:
+                state.subdomains |= extract_subdomains_from_text(root_domain, js_text)
 
-    openapi_findings: list[Finding] = []
-    openapi_param_refs: list[tuple[str, str, str]] = []
-    openapi_endpoints: set[str] = set()
-    if profile in {"full", "deep", "api"}:
-        spec_urls: set[str] = set(openapi_candidate_urls(base_url))
-        for f in state.surface_findings:
-            if any(k in f.url for k in ("/swagger", "/swagger-ui", "/api-docs", "/docs")):
-                res = fetch(f.url, timeout=timeout, insecure=insecure, max_bytes=700_000)
-                if res and res.body and is_html_content_type(res.headers.get("content-type", "")):
-                    spec_urls |= extract_openapi_urls_from_html(base_url, decode_bytes(res.body))
-        for spec_url in list(spec_urls)[:10]:
-            res = fetch(spec_url, timeout=timeout, insecure=insecure, max_bytes=2_000_000)
-            if not res or not res.body:
-                continue
-            text = decode_bytes(res.body)
-            endpoints, param_refs, auth_schemes = parse_openapi_spec(text)
-            if not endpoints:
-                continue
-            openapi_findings.append(score_openapi_presence(res.url, len(endpoints)))
-            if auth_schemes:
-                openapi_findings.append(
-                    Finding(
-                        title="Auth scheme terdeteksi dari OpenAPI",
-                        category="ApiSpec",
-                        severity=severity_from_score(45),
-                        score=45,
-                        evidence=", ".join(sorted(auth_schemes))[:140],
-                        url=res.url,
-                        explanation="Auth scheme dari OpenAPI membantu fokus: bearer/jwt/apiKey sering jadi target uji (misconfig, scope, permission).",
-                    )
-                )
-            for pth in endpoints:
-                openapi_endpoints.add(urljoin(base_url + "/", str(pth).lstrip("/")))
-            openapi_param_refs.extend(param_refs)
-            break
-    if profile in {"full", "deep"} and root_domain:
-        state.subdomains |= extract_subdomains_from_urls(root_domain, openapi_endpoints)
+        if profile in {"full", "deep", "javascript"}:
+            for idx, blob in enumerate(crawled_inline[:25]):
+                pseudo = f"{base_url}#inline-{idx+1}"
+                endpoints, secrets, intel, internal = analyze_js_blob(base_url, pseudo, blob)
+                for u in endpoints:
+                    if is_same_site(base_url, u):
+                        state.endpoints_from_js.add(u)
+                        state.discovered_urls.add(u)
+                state.secrets.extend(secrets)
+                js_intel_findings.extend(intel)
+                internal_seen |= internal
+        if profile in {"full", "deep"} and root_domain:
+            state.subdomains |= extract_subdomains_from_urls(root_domain, state.endpoints_from_js)
 
-    shadow_endpoints: list[Finding] = []
-    if state.endpoints_from_js:
-        html_set = {urlsplit(u).path for u in state.html_urls}
-        for u in sorted(state.endpoints_from_js):
-            p = urlsplit(u).path
-            if p and p not in html_set:
-                score = 40
-                shadow_endpoints.append(
-                    Finding(
-                        title="API shadow endpoints (hanya dari JS)",
-                        category="JSIntelligence",
-                        severity=severity_from_score(score),
-                        score=score,
-                        evidence=p,
-                        url=u,
-                        explanation="Endpoint ini muncul di JavaScript tapi tidak terlihat di HTML. Sering jadi surface tersembunyi atau internal feature flag.",
+        if state.endpoints_from_js:
+            html_set = {urlsplit(u).path for u in state.html_urls}
+            for u in sorted(state.endpoints_from_js):
+                p = urlsplit(u).path
+                if p and p not in html_set:
+                    score = 40
+                    shadow_endpoints.append(
+                        Finding(
+                            title="API shadow endpoints (hanya dari JS)",
+                            category="JSIntelligence",
+                            severity=severity_from_score(score),
+                            score=score,
+                            evidence=p,
+                            url=u,
+                            explanation="Endpoint ini muncul di JavaScript tapi tidak terlihat di HTML. Sering jadi surface tersembunyi atau internal feature flag.",
+                        )
                     )
-                )
-            if len(shadow_endpoints) >= 15:
+                if len(shadow_endpoints) >= 15:
+                    break
+
+        if profile in {"full", "deep", "api"}:
+            status.update("[bold cyan]Detecting OpenAPI/Swagger specs...[/bold cyan]")
+            spec_urls: set[str] = set(openapi_candidate_urls(base_url))
+            for f in state.surface_findings:
+                if any(k in f.url for k in ("/swagger", "/swagger-ui", "/api-docs", "/docs")):
+                    res = fetch(f.url, timeout=timeout, insecure=insecure, max_bytes=700_000)
+                    if res and res.body and is_html_content_type(res.headers.get("content-type", "")):
+                        spec_urls |= extract_openapi_urls_from_html(base_url, decode_bytes(res.body))
+            for spec_url in list(spec_urls)[:10]:
+                res = fetch(spec_url, timeout=timeout, insecure=insecure, max_bytes=2_000_000)
+                if not res or not res.body:
+                    continue
+                text = decode_bytes(res.body)
+                endpoints, param_refs, auth_schemes = parse_openapi_spec(text)
+                if not endpoints:
+                    continue
+                openapi_findings.append(score_openapi_presence(res.url, len(endpoints)))
+                if auth_schemes:
+                    openapi_findings.append(
+                        Finding(
+                            title="Auth scheme terdeteksi dari OpenAPI",
+                            category="ApiSpec",
+                            severity=severity_from_score(45),
+                            score=45,
+                            evidence=", ".join(sorted(auth_schemes))[:140],
+                            url=res.url,
+                            explanation="Auth scheme dari OpenAPI membantu fokus: bearer/jwt/apiKey sering jadi target uji (misconfig, scope, permission).",
+                        )
+                    )
+                for pth in endpoints:
+                    openapi_endpoints.add(urljoin(base_url + "/", str(pth).lstrip("/")))
+                openapi_param_refs.extend(param_refs)
                 break
+            if root_domain:
+                state.subdomains |= extract_subdomains_from_urls(root_domain, openapi_endpoints)
 
     if profile in {"full", "deep", "api", "javascript"}:
         candidate_urls = set(state.discovered_urls) | set(state.endpoints_from_js)
